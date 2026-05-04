@@ -1,0 +1,45 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Flashburst runtime state
+.flashburst/
+demo/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local caches and logs
+.cache/
+*.log
+.flash/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local planning/research docs are not tracked in this repo
+docs/

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "companion-clis": {
+      "source": "runpod/skills",
+      "sourceType": "github",
+      "skillPath": "companion-clis/SKILL.md",
+      "computedHash": "5ed7e388eaa94501995edee5e8fb5b9028d0a2f8029b1f4ea531f7adf98ac6ce"
+    },
+    "flash": {
+      "source": "runpod/skills",
+      "sourceType": "github",
+      "skillPath": "flash/SKILL.md",
+      "computedHash": "135a8c0a488aee2d1ca2170f5b8bf194febbf10bbb11c1ced3d123df0436847b"
+    },
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "computedHash": "784f0dbb7403b0f00324bce9a112f715342777a0daee7bbb7385f9c6f0a170ea"
+    },
+    "grill-with-docs": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
+      "computedHash": "31a5b1ae116558bf7d3f633f442835f54bd7645923d4f45c7823e52a97317666"
+    },
+    "runpodctl": {
+      "source": "runpod/skills",
+      "sourceType": "github",
+      "skillPath": "runpodctl/SKILL.md",
+      "computedHash": "fd7a47f981eefecfc7d96f80856074aae382e49cbe611a6fad4eee8ef3bed5c4"
+    }
+  }
+}
