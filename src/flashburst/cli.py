@@ -406,11 +406,12 @@ def run_workload(
         if unique_stage_fields:
             try:
                 get_r2_config(workspace)
-            except KeyError as exc:
-                raise typer.BadParameter(
+            except KeyError:
+                console.print(
                     "--stage-field requires R2 configuration. Run "
                     "`flashburst configure r2 --bucket ... --account-id ...` first."
-                ) from exc
+                )
+                raise typer.Exit(code=1)
         flash_config = FlashConfig(
             endpoint_id=str(profile_config["endpoint_id"]),
             timeout_seconds=int(
