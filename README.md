@@ -1,8 +1,8 @@
 # Flashburst
 
-Flashburst is an agent-native batch runner for Python workloads that need
-durable job state, artifact tracking, resumability, and optional Runpod
-burst capacity.
+Flashburst is an agent-native GPU workload runner that prioritizes **local 
+GPU use first, with optional cloud GPU burst using Runpod Flash**. It's for 
+Python jobs that need durable job state, artifact tracking, and resumability.
 
 The user should describe an outcome to an agent, not memorize orchestration
 commands. Flashburst gives the agent a small command surface for inspecting a
@@ -11,9 +11,9 @@ Runpod Flash wrappers, and reporting outputs.
 
 My current use case is batch processing podcast transcriptions. I'm GPU-poor
 with only one 3090, so when there are hundreds of episodes to transcribe, I
-could use a little help. Runpod Flash abstracts serverless worker deployment
-and autoscaling; for transcription I'm using `faster-whisper` on an
-`AMPERE_24` GPU group.
+could use a little help. Runpod Flash is a convenient abstraction for 
+serverless worker deployment and autoscaling. For transcription I'm using 
+`faster-whisper` on an `AMPERE_24` GPU group.
 
 ## Agent-Native Flow
 
