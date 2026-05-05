@@ -1,14 +1,9 @@
-import json
-from decimal import Decimal
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from flashburst.cli import app
 from flashburst.db import FlashburstDB
-from flashburst.examples.prepare_embeddings import prepare_embedding_jobs
-from flashburst.models import AttemptStatus, JobSpec, PlacementKind
-from flashburst.scheduler import create_plan_from_jobs_file
 
 
 runner = CliRunner()
@@ -69,7 +64,9 @@ def test_friendly_configure_commands(tmp_path: Path) -> None:
             "--endpoint-id",
             "rp_test",
             "--profile",
-            "bge-small-burst",
+            "fake-burst",
+            "--capability",
+            "embedding.fake-deterministic",
             "--db",
             str(db_path),
         ],
@@ -78,10 +75,13 @@ def test_friendly_configure_commands(tmp_path: Path) -> None:
     assert r2.exit_code == 0
     assert runpod.exit_code == 0
     assert (workspace / "config.json").exists()
-    assert FlashburstDB(db_path).get_cloud_profile("bge-small-burst") is not None
+    profile = FlashburstDB(db_path).get_cloud_profile("fake-burst")
+    assert profile is not None
+    assert profile.config["run_timeout_seconds"] == 600
+    assert profile.config["artifact_grant_expires_seconds"] == 3600
 
 
-def test_friendly_prepare_preview_and_execute_mock(tmp_path: Path) -> None:
+def test_friendly_prepare_and_run_queue_local(tmp_path: Path) -> None:
     workspace = tmp_path / ".flashburst"
     db_path = workspace / "flashburst.db"
     input_path = tmp_path / "texts.jsonl"
@@ -96,112 +96,96 @@ def test_friendly_prepare_preview_and_execute_mock(tmp_path: Path) -> None:
             str(input_path),
             "--capability",
             "embedding.fake-deterministic",
-            "--model-name",
-            "",
             "--workspace",
             str(workspace),
         ],
     )
-    preview = runner.invoke(
+    run = runner.invoke(
         app,
         [
-            "preview",
+            "run-queue",
             str(workspace / "jobs" / "embeddings.jsonl"),
-            "--cloud",
-            "--backend",
-            "mock",
-            "--budget",
-            "1.00",
+            "--local-slots",
+            "1",
             "--workspace",
             str(workspace),
             "--db",
             str(db_path),
         ],
     )
-    plan_ids = [path.stem for path in (workspace / "plans").glob("*.json")]
-    execute = runner.invoke(
-        app,
-        ["execute", plan_ids[0], "--approve", "--workspace", str(workspace), "--db", str(db_path)],
-    )
     status = runner.invoke(app, ["status", "--results", "--db", str(db_path)])
 
     assert prepare.exit_code == 0
-    assert preview.exit_code == 0
-    assert "Run with: flashburst execute" in preview.output
-    assert execute.exit_code == 0
-    assert "Plan run complete: 1 completed, 0 skipped." in execute.output
+    assert run.exit_code == 0
+    assert "Queue run complete: 1 completed, 0 skipped." in run.output
     assert status.exit_code == 0
     assert "succeeded: 1" in status.output
 
 
-def test_inspect_plan_outputs_job_state(tmp_path: Path) -> None:
+def test_run_queue_executes_external_workload_locally(
+    tmp_path: Path,
+    external_workload_project,
+) -> None:
     workspace = tmp_path / ".flashburst"
-    input_path = tmp_path / "texts.jsonl"
-    input_path.write_text('{"id":"a","text":"hello"}\n')
-    jobs_path = prepare_embedding_jobs(
-        input_path=input_path,
-        workspace=workspace,
-        capability="embedding.fake-deterministic",
-        batch_size=1,
+    db_path = workspace / "flashburst.db"
+    manifest = tmp_path / "episodes.jsonl"
+    manifest.write_text(
+        "\n".join(
+            [
+                '{"id":"sse-511","source_url":"https://example.test/sse-511.mp3"}',
+                '{"id":"sse-512","source_url":"https://example.test/sse-512.mp3"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
     )
+    FlashburstDB(db_path).init_schema()
+    add_capability = runner.invoke(
+        app,
+        [
+            "capability",
+            "add",
+            external_workload_project.capability_import,
+            "--project-root",
+            str(external_workload_project.root),
+            "--workspace",
+            str(workspace),
+        ],
+    )
+    jobs_path = external_workload_project.prepare_jobs(
+        source=manifest,
+        workspace=workspace,
+        params={"dry_run": True},
+    )
+
+    run = runner.invoke(
+        app,
+        [
+            "run-queue",
+            str(jobs_path),
+            "--local-slots",
+            "1",
+            "--workspace",
+            str(workspace),
+            "--db",
+            str(db_path),
+        ],
+    )
+
+    assert add_capability.exit_code == 0
+    assert run.exit_code == 0
+    assert "Queue run complete: 2 completed, 0 skipped." in run.output
+    jobs = FlashburstDB(db_path).list_jobs()
+    assert [job["status"] for job in jobs] == ["succeeded", "succeeded"]
+
+
+def test_retry_expired_leases_cli(tmp_path: Path) -> None:
+    workspace = tmp_path / ".flashburst"
     db_path = workspace / "flashburst.db"
     db = FlashburstDB(db_path)
     db.init_schema()
-    plan = create_plan_from_jobs_file(
-        db=db,
-        workspace=workspace,
-        jobs_file=jobs_path,
-        allow_cloud=False,
-        backend=None,
-        budget_usd=Decimal("1.00"),
-    )
 
-    result = runner.invoke(
-        app,
-        ["inspect", "plan", plan.id, "--workspace", str(workspace), "--db", str(db_path), "--json"],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["id"] == plan.id
-    assert payload["budget_limit_usd"] == "1.00"
-    assert payload["items"][0]["placement_kind"] == "local"
-    assert payload["items"][0]["job_status"] == "queued"
-
-
-def test_inspect_attempts_and_retry_expired_cli(tmp_path: Path) -> None:
-    workspace = tmp_path / ".flashburst"
-    input_path = tmp_path / "texts.jsonl"
-    input_path.write_text('{"id":"a","text":"hello"}\n')
-    jobs_path = prepare_embedding_jobs(
-        input_path=input_path,
-        workspace=workspace,
-        capability="embedding.fake-deterministic",
-        batch_size=1,
-    )
-    db_path = workspace / "flashburst.db"
-    db = FlashburstDB(db_path)
-    db.init_schema()
-    with jobs_path.open("r", encoding="utf-8") as handle:
-        job_id = db.insert_job(JobSpec.model_validate_json(handle.readline()))
-    attempt_id = db.create_attempt(
-        job_id=job_id,
-        placement_kind=PlacementKind.MOCK_CLOUD,
-        status=AttemptStatus.SUBMITTED,
-        cloud_profile_id="mock",
-        remote_job_id="remote_123",
-        reserved_cost_usd=Decimal("0.05"),
-    )
-
-    attempts = runner.invoke(
-        app,
-        ["inspect", "attempts", "--db", str(db_path), "--json"],
-    )
     retry = runner.invoke(app, ["leases", "retry-expired", "--db", str(db_path)])
 
-    assert attempts.exit_code == 0
-    payload = json.loads(attempts.output)
-    assert payload[0]["id"] == attempt_id
-    assert payload[0]["remote_job_id"] == "remote_123"
     assert retry.exit_code == 0
     assert "Retried 0 expired leases." in retry.output

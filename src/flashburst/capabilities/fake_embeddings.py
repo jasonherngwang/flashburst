@@ -68,7 +68,6 @@ capability = Capability(
         job_type="embedding.embed_text_batch",
         version="v1",
         supports_local=True,
-        supports_mock_cloud=True,
         supports_runpod_flash=False,
     ),
     local_runner=run,

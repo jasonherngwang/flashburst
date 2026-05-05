@@ -58,3 +58,49 @@ def get_artifact_store_config(workspace: Path) -> dict[str, Any]:
     if not isinstance(store, dict):
         raise ValueError("artifact store is not configured")
     return store
+
+
+def add_capability_import(
+    *,
+    workspace: Path,
+    import_path: str,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    config = load_config(workspace)
+    capabilities = config.setdefault("capabilities", [])
+    if not isinstance(capabilities, list):
+        raise ValueError("capabilities config must be a list")
+    entry = {
+        "import_path": import_path,
+        "project_root": project_root,
+    }
+    capabilities[:] = [
+        item
+        for item in capabilities
+        if not isinstance(item, dict) or item.get("import_path") != import_path
+    ]
+    capabilities.append(entry)
+    save_config(config, workspace)
+    return config
+
+
+def get_capability_imports(workspace: Path) -> list[dict[str, str | None]]:
+    config = load_config(workspace)
+    raw = config.get("capabilities", [])
+    if not isinstance(raw, list):
+        raise ValueError("capabilities config must be a list")
+    imports: list[dict[str, str | None]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        import_path = item.get("import_path")
+        if not isinstance(import_path, str) or not import_path:
+            continue
+        project_root = item.get("project_root")
+        imports.append(
+            {
+                "import_path": import_path,
+                "project_root": project_root if isinstance(project_root, str) else None,
+            }
+        )
+    return imports

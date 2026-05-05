@@ -6,7 +6,6 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import timedelta
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +18,7 @@ from flashburst.models import (
     JobSpec,
     JobStatus,
     PlacementKind,
+    Privacy,
 )
 from flashburst.time import utc_now, utc_now_iso
 
@@ -47,7 +47,6 @@ CREATE TABLE IF NOT EXISTS attempts (
   cloud_profile_id TEXT,
   status TEXT NOT NULL,
   remote_job_id TEXT,
-  reserved_cost_usd TEXT,
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -82,19 +81,8 @@ CREATE TABLE IF NOT EXISTS cloud_profiles (
   backend TEXT NOT NULL,
   endpoint_id TEXT,
   capability TEXT NOT NULL,
-  estimated_cost_per_job_usd TEXT NOT NULL,
   max_concurrent_jobs INTEGER NOT NULL,
   config_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS budget_ledgers (
-  id TEXT PRIMARY KEY,
-  plan_id TEXT NOT NULL,
-  limit_usd TEXT NOT NULL,
-  reserved_usd TEXT NOT NULL,
-  status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -224,7 +212,6 @@ class FlashburstDB:
                 backend=row["backend"],
                 endpoint_id=row["endpoint_id"],
                 capability=row["capability"],
-                estimated_cost_per_job_usd=Decimal(str(row["estimated_cost_per_job_usd"])),
                 max_concurrent_jobs=int(row["max_concurrent_jobs"]),
                 config=json.loads(row["config_json"]),
             )
@@ -237,6 +224,7 @@ class FlashburstDB:
         worker_id: str,
         capability: str,
         lease_seconds: int = 60,
+        job_ids: list[str] | None = None,
     ) -> ClaimedJob | None:
         now_dt = utc_now()
         now = now_dt.isoformat()
@@ -244,15 +232,25 @@ class FlashburstDB:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                job_filter = ""
+                params: list[str] = [JobStatus.QUEUED.value, capability]
+                if job_ids is not None:
+                    if not job_ids:
+                        conn.execute("COMMIT")
+                        return None
+                    placeholders = ",".join("?" for _ in job_ids)
+                    job_filter = f" AND id IN ({placeholders})"
+                    params.extend(job_ids)
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT id FROM jobs
                     WHERE status = ?
                       AND required_capability = ?
+                      {job_filter}
                     ORDER BY created_at, id
                     LIMIT 1
                     """,
-                    (JobStatus.QUEUED.value, capability),
+                    params,
                 ).fetchone()
                 if row is None:
                     conn.execute("COMMIT")
@@ -295,6 +293,73 @@ class FlashburstDB:
                 raise
         return ClaimedJob(job_id=job_id, attempt_id=attempt_id, lease_id=lease_id)
 
+    def claim_next_cloud_job(
+        self,
+        *,
+        worker_id: str,
+        capability: str,
+        cloud_profile_id: str,
+        job_ids: list[str] | None = None,
+    ) -> tuple[str, str] | None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                job_filter = ""
+                params: list[str] = [JobStatus.QUEUED.value, capability, Privacy.CLOUD_OK.value]
+                if job_ids is not None:
+                    if not job_ids:
+                        conn.execute("COMMIT")
+                        return None
+                    placeholders = ",".join("?" for _ in job_ids)
+                    job_filter = f" AND id IN ({placeholders})"
+                    params.extend(job_ids)
+                row = conn.execute(
+                    f"""
+                    SELECT id FROM jobs
+                    WHERE status = ?
+                      AND required_capability = ?
+                      AND privacy = ?
+                      {job_filter}
+                    ORDER BY created_at, id
+                    LIMIT 1
+                    """,
+                    params,
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return None
+
+                job_id = str(row["id"])
+                attempt_id = new_id("att")
+                conn.execute(
+                    """
+                    INSERT INTO attempts (
+                      id, job_id, placement_kind, worker_id, cloud_profile_id,
+                      status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        job_id,
+                        PlacementKind.RUNPOD_FLASH.value,
+                        worker_id,
+                        cloud_profile_id,
+                        AttemptStatus.SUBMITTED.value,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
+                    (JobStatus.RUNNING.value, now, job_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return job_id, attempt_id
+
     def create_attempt(
         self,
         *,
@@ -304,7 +369,6 @@ class FlashburstDB:
         worker_id: str | None = None,
         cloud_profile_id: str | None = None,
         remote_job_id: str | None = None,
-        reserved_cost_usd: Decimal | None = None,
     ) -> str:
         now = utc_now_iso()
         attempt_id = new_id("att")
@@ -315,8 +379,8 @@ class FlashburstDB:
                     """
                     INSERT INTO attempts (
                       id, job_id, placement_kind, worker_id, cloud_profile_id,
-                      status, remote_job_id, reserved_cost_usd, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      status, remote_job_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         attempt_id,
@@ -326,7 +390,6 @@ class FlashburstDB:
                         cloud_profile_id,
                         status.value,
                         remote_job_id,
-                        str(reserved_cost_usd) if reserved_cost_usd is not None else None,
                         now,
                         now,
                     ),
@@ -341,81 +404,54 @@ class FlashburstDB:
                 raise
         return attempt_id
 
-    def reserve_budget(self, *, plan_id: str, limit_usd: Decimal, amount_usd: Decimal) -> bool:
-        now = utc_now_iso()
-        ledger_id = f"budget_{plan_id}"
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute(
-                    "SELECT * FROM budget_ledgers WHERE id = ?",
-                    (ledger_id,),
-                ).fetchone()
-                if row is None:
-                    reserved = Decimal("0")
-                    conn.execute(
-                        """
-                        INSERT INTO budget_ledgers (
-                          id, plan_id, limit_usd, reserved_usd, status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (ledger_id, plan_id, str(limit_usd), "0", "open", now, now),
-                    )
-                else:
-                    reserved = Decimal(str(row["reserved_usd"]))
-                    if row["status"] != "open":
-                        conn.execute("ROLLBACK")
-                        return False
-
-                if reserved + amount_usd > limit_usd:
-                    status = "exhausted"
-                    conn.execute(
-                        """
-                        UPDATE budget_ledgers
-                        SET status = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (status, now, ledger_id),
-                    )
-                    conn.execute("COMMIT")
-                    return False
-
-                conn.execute(
-                    """
-                    UPDATE budget_ledgers
-                    SET reserved_usd = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (str(reserved + amount_usd), now, ledger_id),
-                )
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-        return True
-
-    def get_budget_ledger(self, plan_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM budget_ledgers WHERE plan_id = ?",
-                (plan_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
     def upsert_cloud_profile(self, profile: CloudProfile) -> None:
         now = utc_now_iso()
         with self.connect() as conn:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(cloud_profiles)").fetchall()
+            }
+            # Old alpha workspaces had an estimated-cost column. Keep writes compatible
+            # without exposing cost budgeting in the active CLI.
+            if "estimated_cost_per_job_usd" in columns:
+                conn.execute(
+                    """
+                    INSERT INTO cloud_profiles (
+                      id, backend, endpoint_id, capability, estimated_cost_per_job_usd,
+                      max_concurrent_jobs, config_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      backend = excluded.backend,
+                      endpoint_id = excluded.endpoint_id,
+                      capability = excluded.capability,
+                      estimated_cost_per_job_usd = excluded.estimated_cost_per_job_usd,
+                      max_concurrent_jobs = excluded.max_concurrent_jobs,
+                      config_json = excluded.config_json,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        profile.id,
+                        profile.backend,
+                        profile.endpoint_id,
+                        profile.capability,
+                        "0",
+                        profile.max_concurrent_jobs,
+                        json.dumps(profile.config, sort_keys=True, separators=(",", ":")),
+                        now,
+                        now,
+                    ),
+                )
+                return
             conn.execute(
                 """
                 INSERT INTO cloud_profiles (
-                  id, backend, endpoint_id, capability, estimated_cost_per_job_usd,
+                  id, backend, endpoint_id, capability,
                   max_concurrent_jobs, config_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   backend = excluded.backend,
                   endpoint_id = excluded.endpoint_id,
                   capability = excluded.capability,
-                  estimated_cost_per_job_usd = excluded.estimated_cost_per_job_usd,
                   max_concurrent_jobs = excluded.max_concurrent_jobs,
                   config_json = excluded.config_json,
                   updated_at = excluded.updated_at
@@ -425,7 +461,6 @@ class FlashburstDB:
                     profile.backend,
                     profile.endpoint_id,
                     profile.capability,
-                    str(profile.estimated_cost_per_job_usd),
                     profile.max_concurrent_jobs,
                     json.dumps(profile.config, sort_keys=True, separators=(",", ":")),
                     now,
@@ -446,7 +481,6 @@ class FlashburstDB:
             backend=row["backend"],
             endpoint_id=row["endpoint_id"],
             capability=row["capability"],
-            estimated_cost_per_job_usd=Decimal(str(row["estimated_cost_per_job_usd"])),
             max_concurrent_jobs=int(row["max_concurrent_jobs"]),
             config=json.loads(row["config_json"]),
         )

@@ -59,9 +59,7 @@ class S3ArtifactStore:
     def from_config(cls, config: dict) -> "S3ArtifactStore":
         endpoint_url = config.get("endpoint_url") or os.getenv("R2_ENDPOINT_URL")
         access_key_id = os.getenv("R2_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
-        secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY") or os.getenv(
-            "AWS_SECRET_ACCESS_KEY"
-        )
+        secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
         session_token = os.getenv("R2_SESSION_TOKEN") or os.getenv("AWS_SESSION_TOKEN")
         required = {
             "bucket": config.get("bucket"),

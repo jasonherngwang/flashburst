@@ -1,5 +1,4 @@
 from pathlib import Path
-from decimal import Decimal
 
 from flashburst.db import FlashburstDB
 from flashburst.ids import compute_idempotency_key
@@ -68,22 +67,26 @@ def test_claim_next_local_job_is_atomic_for_single_process(tmp_path: Path) -> No
     assert job["status"] == JobStatus.RUNNING.value
 
 
-def test_budget_reservation_blocks_over_budget(tmp_path: Path) -> None:
+def test_claim_next_cloud_job_only_claims_cloud_ok(tmp_path: Path) -> None:
     db = FlashburstDB(tmp_path / "flashburst.db")
     db.init_schema()
-    assert db.reserve_budget(
-        plan_id="plan_1",
-        limit_usd=Decimal("0.05"),
-        amount_usd=Decimal("0.05"),
+    job_id = db.insert_job(make_spec())
+    claim = db.claim_next_cloud_job(
+        worker_id="cloud-test",
+        capability="embedding.fake-deterministic",
+        cloud_profile_id="mock-profile",
+        job_ids=[job_id],
     )
-    assert not db.reserve_budget(
-        plan_id="plan_1",
-        limit_usd=Decimal("0.05"),
-        amount_usd=Decimal("0.01"),
-    )
-    ledger = db.get_budget_ledger("plan_1")
-    assert ledger is not None
-    assert ledger["reserved_usd"] == "0.05"
+
+    assert claim is not None
+    claimed_job_id, attempt_id = claim
+    assert claimed_job_id == job_id
+    attempts = db.list_attempts(job_id=job_id)
+    assert attempts[0]["id"] == attempt_id
+    assert attempts[0]["placement_kind"] == "runpod_flash"
+    job = db.get_job(job_id)
+    assert job is not None
+    assert job["status"] == JobStatus.RUNNING.value
 
 
 def test_retry_expired_lease_requeues_job(tmp_path: Path) -> None:

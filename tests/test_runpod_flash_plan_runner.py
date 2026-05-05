@@ -1,11 +1,10 @@
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from flashburst.adapters.runpod_flash import RunpodFlashPlanRunner
 from flashburst.db import FlashburstDB
-from flashburst.examples.prepare_embeddings import prepare_embedding_jobs
+from flashburst.workloads.prepare_embeddings import prepare_embedding_jobs
 from flashburst.models import (
     ArtifactGrant,
     ArtifactRef,
@@ -14,19 +13,21 @@ from flashburst.models import (
     JobResult,
     JobSpec,
     JobStatus,
-    PlacementKind,
-    PlanItem,
 )
 
 
 class FakeS3Store:
     bucket = "bucket"
 
+    def __init__(self):
+        self.expiries: list[int] = []
+
     def upload_file(self, source: Path, uri: str, *, media_type: str) -> ArtifactRef:
         assert source.exists()
         return ArtifactRef(uri=uri, media_type=media_type, storage="s3")
 
     def presign_get(self, uri: str, *, expires_seconds: int = 3600) -> ArtifactGrant:
+        self.expiries.append(expires_seconds)
         return ArtifactGrant(
             artifact_uri=uri,
             method="GET",
@@ -41,6 +42,7 @@ class FakeS3Store:
         media_type: str = "application/octet-stream",
         expires_seconds: int = 3600,
     ) -> ArtifactGrant:
+        self.expiries.append(expires_seconds)
         return ArtifactGrant(
             artifact_uri=uri,
             method="PUT",
@@ -51,14 +53,24 @@ class FakeS3Store:
 
 
 class FakeAdapter:
+    def __init__(self):
+        self.timeout_seconds: float | None = None
+
     async def run_envelope(
         self,
         envelope: ExecutionEnvelope,
         *,
         timeout_seconds: float = 600,
+        on_remote_job_id=None,
+        on_status=None,
     ) -> tuple[str, JobResult]:
+        self.timeout_seconds = timeout_seconds
         assert envelope.artifact_grants[0].method == "GET"
         assert envelope.artifact_grants[1].method == "PUT"
+        if on_remote_job_id is not None:
+            on_remote_job_id("remote_123")
+        if on_status is not None:
+            on_status("remote_123", "IN_PROGRESS", {"status": "IN_PROGRESS"})
         return (
             "remote_123",
             JobResult(
@@ -81,7 +93,11 @@ class FakeFailingAdapter:
         envelope: ExecutionEnvelope,
         *,
         timeout_seconds: float = 600,
+        on_remote_job_id=None,
+        on_status=None,
     ) -> tuple[str, JobResult]:
+        if on_remote_job_id is not None:
+            on_remote_job_id("remote_failed")
         return (
             "remote_failed",
             JobResult(
@@ -99,7 +115,7 @@ async def test_runpod_flash_plan_runner_completes_job(tmp_path: Path) -> None:
     jobs_path = prepare_embedding_jobs(
         input_path=input_path,
         workspace=workspace,
-        capability="embedding.bge-small-en-v1.5",
+        capability="embedding.fake-deterministic",
         batch_size=1,
     )
     db = FlashburstDB(workspace / "flashburst.db")
@@ -107,30 +123,45 @@ async def test_runpod_flash_plan_runner_completes_job(tmp_path: Path) -> None:
     with jobs_path.open("r", encoding="utf-8") as handle:
         job_id = db.insert_job(JobSpec.model_validate_json(handle.readline()))
     profile = CloudProfile(
-        id="bge-small-burst",
+        id="fake-burst",
         backend="runpod_flash",
         endpoint_id="rp_test",
-        capability="embedding.bge-small-en-v1.5",
-        estimated_cost_per_job_usd=Decimal("0.05"),
+        capability="embedding.fake-deterministic",
+        config={
+            "run_timeout_seconds": 1800,
+            "artifact_grant_expires_seconds": 7200,
+        },
     )
-    item = PlanItem(
-        job_id=job_id,
-        placement_kind=PlacementKind.RUNPOD_FLASH,
+    claim = db.claim_next_cloud_job(
+        worker_id="queue-cloud-0",
+        capability=profile.capability,
         cloud_profile_id=profile.id,
-        estimated_cost_usd=Decimal("0.05"),
+        job_ids=[job_id],
     )
+    assert claim is not None
+    claimed_job_id, attempt_id = claim
 
+    fake_s3 = FakeS3Store()
+    fake_adapter = FakeAdapter()
     runner = RunpodFlashPlanRunner(
         db=db,
         workspace=workspace,
-        s3_store=FakeS3Store(),
-        adapter_factory=lambda profile: FakeAdapter(),
+        s3_store=fake_s3,
+        adapter_factory=lambda profile: fake_adapter,
     )
 
-    assert await runner.run_item(item=item, profile=profile)
+    assert await runner.run_claimed_job(
+        job_id=claimed_job_id,
+        attempt_id=attempt_id,
+        profile=profile,
+    )
+    assert fake_adapter.timeout_seconds == 1800
+    assert fake_s3.expiries == [7200, 7200]
     job = db.get_job(job_id)
     assert job is not None
     assert job["status"] == JobStatus.SUCCEEDED.value
+    attempts = db.list_attempts(job_id)
+    assert attempts[0]["remote_job_id"] == "remote_123"
 
 
 @pytest.mark.asyncio
@@ -141,7 +172,7 @@ async def test_runpod_flash_plan_runner_reports_remote_failure(tmp_path: Path) -
     jobs_path = prepare_embedding_jobs(
         input_path=input_path,
         workspace=workspace,
-        capability="embedding.bge-small-en-v1.5",
+        capability="embedding.fake-deterministic",
         batch_size=1,
     )
     db = FlashburstDB(workspace / "flashburst.db")
@@ -149,18 +180,19 @@ async def test_runpod_flash_plan_runner_reports_remote_failure(tmp_path: Path) -
     with jobs_path.open("r", encoding="utf-8") as handle:
         job_id = db.insert_job(JobSpec.model_validate_json(handle.readline()))
     profile = CloudProfile(
-        id="bge-small-burst",
+        id="fake-burst",
         backend="runpod_flash",
         endpoint_id="rp_test",
-        capability="embedding.bge-small-en-v1.5",
-        estimated_cost_per_job_usd=Decimal("0.05"),
+        capability="embedding.fake-deterministic",
     )
-    item = PlanItem(
-        job_id=job_id,
-        placement_kind=PlacementKind.RUNPOD_FLASH,
+    claim = db.claim_next_cloud_job(
+        worker_id="queue-cloud-0",
+        capability=profile.capability,
         cloud_profile_id=profile.id,
-        estimated_cost_usd=Decimal("0.05"),
+        job_ids=[job_id],
     )
+    assert claim is not None
+    claimed_job_id, attempt_id = claim
 
     runner = RunpodFlashPlanRunner(
         db=db,
@@ -169,7 +201,11 @@ async def test_runpod_flash_plan_runner_reports_remote_failure(tmp_path: Path) -
         adapter_factory=lambda profile: FakeFailingAdapter(),
     )
 
-    assert not await runner.run_item(item=item, profile=profile)
+    assert not await runner.run_claimed_job(
+        job_id=claimed_job_id,
+        attempt_id=attempt_id,
+        profile=profile,
+    )
     job = db.get_job(job_id)
     assert job is not None
     assert job["status"] == JobStatus.FAILED.value

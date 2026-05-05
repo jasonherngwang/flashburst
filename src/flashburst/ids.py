@@ -8,6 +8,16 @@ from typing import Any
 from uuid import uuid4
 
 
+STABLE_ARTIFACT_IDENTITY_KEYS = (
+    "uri",
+    "storage",
+    "media_type",
+    "sha256",
+    "size_bytes",
+    "producer_job_id",
+)
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
@@ -25,10 +35,14 @@ def compute_idempotency_key(
     runner_version: str = "v1",
     output_schema_version: str = "v1",
 ) -> str:
+    stable_artifacts = [
+        {key: artifact.get(key) for key in STABLE_ARTIFACT_IDENTITY_KEYS if key in artifact}
+        for artifact in input_artifacts
+    ]
     payload = {
         "job_type": job_type,
         "required_capability": required_capability,
-        "input_artifacts": input_artifacts,
+        "input_artifacts": stable_artifacts,
         "params": params,
         "runner_version": runner_version,
         "output_schema_version": output_schema_version,

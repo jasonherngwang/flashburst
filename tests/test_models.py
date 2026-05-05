@@ -61,3 +61,32 @@ def test_idempotency_key_is_deterministic_for_canonical_params() -> None:
         params={"a": 1, "b": 2},
     )
     assert first == second
+
+
+def test_idempotency_key_ignores_volatile_artifact_metadata() -> None:
+    stable_artifact = {
+        "uri": "local://inputs/batch.jsonl",
+        "sha256": "abc",
+        "media_type": "application/x-ndjson",
+        "storage": "local",
+        "created_at": "2026-05-04T00:00:00Z",
+    }
+    later_artifact = {
+        **stable_artifact,
+        "created_at": "2026-05-04T01:00:00Z",
+    }
+
+    first = compute_idempotency_key(
+        job_type="embedding.embed_text_batch",
+        required_capability="embedding.fake-deterministic",
+        input_artifacts=[stable_artifact],
+        params={"a": 1},
+    )
+    second = compute_idempotency_key(
+        job_type="embedding.embed_text_batch",
+        required_capability="embedding.fake-deterministic",
+        input_artifacts=[later_artifact],
+        params={"a": 1},
+    )
+
+    assert first == second

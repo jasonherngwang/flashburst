@@ -6,8 +6,8 @@ help: ## Show available commands
 dev: ## Install normal development dependencies
 	uv sync --extra dev --extra s3 --extra runpod
 
-dev-full: ## Install all local MVP dependencies, including embeddings/GPU support
-	uv sync --extra dev --extra s3 --extra runpod --extra embeddings
+dev-full: ## Install all local development and optional runtime dependencies
+	uv sync --extra dev --extra s3 --extra runpod
 
 test: ## Run the unit test suite
 	uv run pytest
@@ -21,19 +21,19 @@ format: ## Format Python code with Ruff
 format-check: ## Check Python formatting
 	uv run ruff format --check
 
-quality-check: lint test ## Run the lightweight local quality gate
+quality-check: lint format-check test build ## Run the lightweight local quality gate
 
 build: ## Build the Python package
 	uv build
 
-smoke-local: ## Run the local GPU embedding smoke test
+smoke-local: ## Run the deterministic local smoke test
+	mkdir -p demo
+	printf '%s\n' '{"id":"local-smoke","text":"hello from local flashburst"}' > demo/texts.jsonl
 	uv run flashburst init
-	uv run flashburst examples embeddings prepare demo/texts.jsonl \
-		--capability embedding.bge-small-en-v1.5 \
-		--model-name sentence-transformers/all-MiniLM-L6-v2
-	uv run flashburst submit .flashburst/jobs/embeddings.jsonl
-	uv run flashburst worker run --id local-smoke --capability embedding.bge-small-en-v1.5 --once
-	uv run flashburst inspect results
+	uv run flashburst prepare embeddings demo/texts.jsonl \
+		--capability embedding.fake-deterministic
+	uv run flashburst run-queue .flashburst/jobs/embeddings.jsonl --local-slots 1
+	uv run flashburst status --results
 
 clean: ## Remove local caches and build artifacts
 	rm -rf build dist *.egg-info .pytest_cache .ruff_cache
