@@ -1,66 +1,121 @@
 # Testing
 
-## Routine Checks
+This file covers the external validation path for Flashburst. The default checks
+do not require credentials, a GPU, R2, Runpod, or paid cloud work.
 
-No credentials, GPU, R2 bucket, or Runpod endpoint required:
+## Routine Check
+
+Run the normal local quality gate:
 
 ```bash
-make dev
 make quality-check
 ```
 
-Equivalent direct commands:
+This runs Ruff, format checking, pytest, and package build. A clean result should
+look like:
 
-```bash
-uv sync --extra dev --extra s3 --extra runpod
-uv run ruff check
-uv run pytest
+```text
+All checks passed
+tests passing
+sdist and wheel built successfully
 ```
 
-## Local GPU Smoke
+## Local Smoke
 
-Requires the embeddings extra and a working local GPU environment:
+This verifies the CLI, local SQLite workspace, deterministic built-in workload,
+artifact writing, and result inspection without cloud credentials.
 
 ```bash
-make dev-full
-make smoke-local
+mkdir -p demo
+printf '%s\n' '{"id":"local-a","text":"hello from local flashburst"}' > demo/texts.jsonl
+
+uv run flashburst init
+uv run flashburst prepare embeddings demo/texts.jsonl \
+  --capability embedding.fake-deterministic \
+  --batch-size 1
+
+uv run flashburst run-queue .flashburst/jobs/embeddings.jsonl \
+  --local-slots 1
+
+uv run flashburst status --results
 ```
 
 Expected result:
 
 ```text
-one embedding job succeeds
-status --results reports the GPU device
-output is written under .flashburst/artifacts/outputs/
+one job succeeds
+an output artifact is written under .flashburst/artifacts/outputs/
+status --results shows the completed result
 ```
 
-## Cloud Smoke
+## Custom Workload Smoke
 
-Requires Cloudflare R2 credentials, Runpod authentication, a deployed Runpod
-Flash endpoint, and explicit approval before paid work.
+For a user-owned workload, the validation sequence is the same shape:
+
+```text
+flashburst init
+flashburst capability add <module>:capability --project-root .
+python prepare_jobs.py <manifest>
+flashburst run-queue .flashburst/jobs/<job-file>.jsonl --local-slots 1
+flashburst status --results
+```
+
+The companion `transcription-test` repo is an example of this shape.
+It keeps transcription logic in the workload project and uses Flashburst only
+for job state, capability loading, local execution, artifact tracking, and
+optional cloud placement.
+
+## Optional Cloud Smoke
+
+Cloud validation is optional and may create paid Runpod/R2 usage. Run it only
+when you intentionally want to validate a deployed endpoint.
+
+Prerequisites:
+
+```text
+R2_BUCKET
+R2_ENDPOINT_URL
+R2_ACCESS_KEY_ID
+R2_SECRET_ACCESS_KEY
+RUNPOD_API_KEY or completed flash login
+an already deployed Runpod Flash endpoint id
+```
+
+Configure Flashburst from the workload project:
 
 ```bash
-uv run flashburst configure r2 --bucket "$R2_BUCKET" --endpoint-url "$R2_ENDPOINT_URL"
-uv run flashburst configure runpod --endpoint-id <runpod-endpoint-id>
+uv run flashburst configure r2 \
+  --bucket "$R2_BUCKET" \
+  --endpoint-url "$R2_ENDPOINT_URL"
+
+uv run flashburst configure runpod \
+  --profile <profile-name> \
+  --capability <capability-name> \
+  --endpoint-id <runpod-endpoint-id> \
+  --max-concurrent-jobs 1
+
 uv run flashburst check --cloud
+```
 
-mkdir -p demo
-printf '%s\n' '{"id":"cloud-a","text":"hello from flashburst on runpod"}' > demo/cloud-texts.jsonl
-uv run flashburst prepare embeddings demo/cloud-texts.jsonl
+Then prepare a cloud-eligible job with the workload's prep script and run a
+bounded queue:
 
-uv run flashburst preview .flashburst/jobs/embeddings.jsonl \
-  --cloud \
-  --profile bge-small-burst \
-  --budget 1.00
-uv run flashburst execute <plan-id> --approve
+```bash
+uv run python prepare_jobs.py cloud-manifest.jsonl --cloud-ok --limit 1
+
+uv run flashburst run-queue .flashburst/jobs/<job-file>.jsonl \
+  --local-slots 1 \
+  --cloud-slots 1 \
+  --profile <profile-name> \
+  --approve-cloud
+
 uv run flashburst status --pull --results
 ```
 
 Expected result:
 
 ```text
-remote job id recorded
-output artifact stored in R2
-output artifact pulled locally
-result metrics include model, device, input count, vector dimension, and timing
+local and/or Runpod attempts are recorded
+remote artifacts are staged through R2/S3 grants
+status --pull --results shows completed output artifacts
 ```

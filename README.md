@@ -1,161 +1,129 @@
 # Flashburst
 
-Flashburst is a local-first GPU job runner with explicit Runpod Flash burst
-execution. It tracks jobs, attempts, artifacts, results, cloud profiles, and
-budget reservations in a local SQLite workspace.
+Flashburst is a lightweight local control plane for **distributing workloads
+across local and cloud GPUs.**
 
-Validated path:
+It runs user-owned Python jobs, defaults to local execution, and can "burst" to
+a Runpod Flash endpoint to get things done faster. It's meant for projects that
+have outgrown a Jupyter notebook and need durable job state, artifact tracking,
+and resumability.
+
+My current use case is batch processing podcast transcriptions. I am GPU-poor
+with only one 3090, so when there are hundreds of episodes to transcribe, I
+could use a little help. Runpod Flash offers a pretty easy-to-use interface that
+abstracts worker deployment and autoscaling. For transcription I'm using
+`faster-whisper` on an `AMPERE_24` GPU group, with a few cloud workers.
+
+## Features
+
+Flashburst is simple and local-first:
+
+- We use SQLite as a durable local queue, storing jobs, attempts, leases,
+  artifacts, and results.
+- The local GPU gets first claim. I rescued my poor GPU from a crypto miner's
+  garage and want to put it to good use. Cloud slots only claim `cloud_ok` work
+  when local capacity is already busy.
+- Workloads often involve loading large model weights. Flash workers can keep
+  model state in memory across jobs so we don't have to reload it, as long as
+  the idle timeout has not expired. When the job is done, the workers can scale
+  down to zero.
+- Cloudflare R2 (object storage) serves as the handoff layer between our local
+  controller and cloud workers. We use presigned URLs so cloud workers get only
+  temporary artifact access.
+- Model logic stays in our workload project. Flashburst only owns queueing,
+  placement, artifacts, and state.
 
 ```text
-embedding job -> local worker or Runpod Flash -> local/R2 artifacts -> result record
+             .flashburst queue
+                    |
+                    v
+          flashburst run-queue
+                    |
+        +-----------+------------+
+        |                        |
+ local slot available?      local slots busy
+        |                        |
+        v                        v
+  run on local GPU       cloud_ok + approved?
+                                 |
+                                 v
+              Cloudflare R2 presigned URL handoff
+                                 |
+                                 v
+                         Runpod Flash worker
 ```
 
-## Install
+`run-queue` is the foreground controller that imports jobs, leases work to local
+and cloud slots, records attempts, and exits when the selected queue is drained.
+If interrupted, rerun the same command to continue from saved state.
+
+## Commands
+
+Flashburst is in alpha; install from a local checkout:
 
 ```bash
-uv sync --extra dev --extra s3 --extra runpod
-uv run flashburst --help
-make quality-check
+uv add --editable ../flashburst
 ```
 
-For local embedding/GPU smoke tests:
+Your workload exposes one file-based runner:
+
+```python
+from pathlib import Path
+from typing import Any
+
+
+def run_job(input_path: Path, output_path: Path, params: dict[str, Any]) -> dict[str, Any]:
+    # read one input file, write one output file
+    ...
+    return {"status": "succeeded", "metrics": {...}}
+```
+
+Scaffold the thin Flashburst glue around that runner:
 
 ```bash
-uv sync --extra dev --extra s3 --extra runpod --extra embeddings
+uv run flashburst workload scaffold \
+  --package my_workload \
+  --capability audio.transcribe.local \
+  --job-type audio.transcribe \
+  --runner-import my_workload.core:run_job
 ```
 
-## Configuration
+Add `--runpod` if this workload should also be eligible for cloud placement.
 
-Flashburst stores non-secret state under `.flashburst/`.
-
-Secrets are read from the shell environment:
-
-```bash
-cp .env.example .env.local
-$EDITOR .env.local
-chmod 600 .env.local
-set -a
-source .env.local
-set +a
-```
-
-Required for R2:
-
-```bash
-export R2_BUCKET=your-r2-bucket
-export R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
-export R2_ACCESS_KEY_ID=...
-export R2_SECRET_ACCESS_KEY=...
-```
-
-Required for Runpod execution:
-
-```bash
-export RUNPOD_API_KEY=...
-```
-
-## CLI
-
-The normal workflow uses seven top-level commands:
+Run locally first:
 
 ```bash
 uv run flashburst init
-uv run flashburst check --cloud
-uv run flashburst configure r2 --bucket "$R2_BUCKET" --endpoint-url "$R2_ENDPOINT_URL"
-uv run flashburst configure runpod --endpoint-id <runpod-endpoint-id>
-
-mkdir -p demo
-printf '%s\n' '{"id":"cloud-a","text":"hello from flashburst on runpod"}' > demo/cloud-texts.jsonl
-uv run flashburst prepare embeddings demo/cloud-texts.jsonl
-
-uv run flashburst preview .flashburst/jobs/embeddings.jsonl \
-  --cloud \
-  --profile bge-small-burst \
-  --budget 1.00
-uv run flashburst execute <plan-id> --approve
-uv run flashburst status --pull --results
-```
-
-Advanced diagnostic commands remain available but are hidden from top-level help:
-`artifacts`, `cloud`, `inspect`, `leases`, `worker`, `examples`, `submit`,
-`plan`, `approve`, `run`, and `doctor`.
-
-## Local Smoke
-
-```bash
-mkdir -p demo
-printf '%s\n' '{"id":"local-a","text":"hello from local flashburst"}' > demo/texts.jsonl
-
-uv run flashburst init
-uv run flashburst prepare embeddings demo/texts.jsonl \
-  --capability embedding.bge-small-en-v1.5 \
-  --model-name sentence-transformers/all-MiniLM-L6-v2 \
-  --batch-size 1
-uv run flashburst submit .flashburst/jobs/embeddings.jsonl
-uv run flashburst worker run \
-  --id local-smoke \
-  --capability embedding.bge-small-en-v1.5 \
-  --once
+uv run flashburst capability add my_workload.capabilities:capability --project-root .
+uv run python prepare_jobs.py manifest.jsonl
+uv run flashburst run-queue .flashburst/jobs/audio.transcribe.jsonl
 uv run flashburst status --results
 ```
 
-## R2 Smoke
+## Cloud Burst
+
+Configure a Runpod endpoint and a Cloudflare R2 bucket:
 
 ```bash
-uv run flashburst configure r2 --bucket "$R2_BUCKET" --endpoint-url "$R2_ENDPOINT_URL"
+uv run flashburst configure r2 \
+  --bucket "$R2_BUCKET" \
+  --endpoint-url "$R2_ENDPOINT_URL"
 
-printf 'hello r2\n' > demo/r2-smoke.txt
-uv run flashburst artifacts put \
-  demo/r2-smoke.txt \
-  "s3://$R2_BUCKET/flashburst/smoke/test.txt" \
-  --media-type text/plain
-uv run flashburst artifacts grant-read \
-  "s3://$R2_BUCKET/flashburst/smoke/test.txt" \
-  --expires-seconds 300
-```
-
-The returned presigned URL should download `hello r2`.
-
-## Runpod Flash Smoke
-
-Deploy the example endpoint:
-
-```bash
-cd examples/runpod_flash_embedding_endpoint
-uv run flash deploy
-```
-
-Copy the endpoint id from the deploy URL:
-
-```text
-https://api.runpod.ai/v2/<endpoint-id>/runsync
-```
-
-Configure and run from the repo root:
-
-```bash
 uv run flashburst configure runpod \
-  --endpoint-id <endpoint-id> \
-  --estimated-cost-per-job-usd 0.05
-uv run flashburst check --cloud
-
-mkdir -p demo
-printf '%s\n' '{"id":"cloud-a","text":"hello from flashburst on runpod"}' > demo/cloud-texts.jsonl
-uv run flashburst prepare embeddings demo/cloud-texts.jsonl
-
-uv run flashburst preview .flashburst/jobs/embeddings.jsonl \
-  --cloud \
-  --profile bge-small-burst \
-  --budget 1.00
-uv run flashburst execute <plan-id> --approve
-uv run flashburst status --pull --results
+  --capability audio.transcribe.local \
+  --endpoint-id <runpod-endpoint-id>
 ```
 
-Expected result:
+Prepare cloud-eligible jobs with your workload script, then allow one local slot
+and one cloud slot:
 
-```text
-remote job id recorded
-output artifact stored in R2
-output artifact pulled under .flashburst/artifacts/pulled/
-metrics include model, device, input count, vector dimension, and timing
+```bash
+uv run python prepare_jobs.py manifest.jsonl --cloud-ok
+
+uv run flashburst run-queue .flashburst/jobs/audio.transcribe.jsonl \
+  --cloud-slots 1 \
+  --profile runpod-burst \
+  --approve-cloud
+
+uv run flashburst status --pull --results
 ```
