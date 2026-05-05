@@ -42,4 +42,4 @@ demo/
 .vscode/
 
 # Local planning/research docs are not tracked in this repo
-docs/
+docs_internal/
