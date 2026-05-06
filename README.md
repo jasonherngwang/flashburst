@@ -124,10 +124,11 @@ The workload should not import Flashburst, DBOS, Runpod, or R2 helpers. Keep
 domain code ordinary and editable; let Flashburst handle run state and cloud
 handoff.
 
-`podcast-transcriber` is the intended consumer shape: a normal domain repo
-keeps its own CLI and model code, while its README tells an agent to configure
-Flashburst state, run local validation, scaffold or verify `endpoint.py`, and
-only run paid cloud canaries after explicit approval.
+`podcast-transcriber`(https://github.com/jasonherngwang/podcast-transcriber) 
+is the intended consumer shape: a normal domain repo keeps its own CLI and 
+model code, while its README tells an agent to configure Flashburst state, 
+run local validation, scaffold or verify `endpoint.py`, and only run paid 
+cloud canaries after explicit approval.
 
 ## Shared State
 
