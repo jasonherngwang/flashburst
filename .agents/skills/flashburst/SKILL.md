@@ -1,154 +1,185 @@
 ---
 name: flashburst
-description: Adapt and operate Flashburst workload repositories. Use when a user asks to install Flashburst from a local checkout, make a Python workload Flashburst-ready, add a thin run_job(input_path, output_path, params) adapter, bind or run manifests, inspect results, clear generated state, scaffold Runpod Flash endpoints, check R2/Runpod readiness, run local/cloud/hybrid work, or observe DBOS queue state without requiring command memorization.
+description: Adapt and operate Flashburst workload repositories. Use when asked to make a Python workload Flashburst-ready from scratch or from existing scripts/packages/CLIs, bind or run manifests, inspect results, scaffold Runpod Flash endpoints, check R2/Runpod readiness, run local/cloud/hybrid work, or inspect DBOS queue state without making the user memorize commands.
 ---
 
 # Flashburst
 
-## Mission
+## Rules
 
-Operate from the workload repo. Inspect the existing workload, make the
-smallest durable adaptation, run the right Flashburst commands, verify results,
-and report changed files plus run output paths.
+- This is an agent-native app. Translate the user's requested outcome into
+  Flashburst actions, run them, verify results, and report what happened. Do
+  not make the user memorize or execute command sequences.
+- Operate from the workload repo. Treat the Flashburst checkout as the editable
+  dependency and docs source.
+- Workload repos own business logic, dependencies, JSONL manifests, the thin
+  `run_job(input_path, output_path, params)` adapter, and optional `endpoint.py`.
+- Keep the original workload easy to edit: domain logic should remain in normal
+  project modules with normal tests; Flashburst glue should be thin and obvious.
+- Flashburst owns binding, DBOS local execution, resume behavior, local/cloud
+  placement, R2 staging, Runpod submission, remote output download, and
+  `.flashburst/runs/<run-id>/results.jsonl`.
+- Do not add Flashburst, DBOS, Runpod, boto3, cloud SDKs, or presigned URL
+  handling to workload business code.
+- Use short commands: `context`, `bind`, `run`, `status`, `queue`, `scaffold`,
+  `configure`. Use `workload inspect` and `manifest inspect/validate` only for
+  diagnosis.
+- Do not resurrect deleted legacy patterns: capability registry, `JobSpec`,
+  `run-queue`, workload scaffold, prepare commands, SQLite job DB, leases, or
+  generic artifact modules.
 
-Use the Flashburst checkout only as an editable dependency and documentation
-source. Do not run the workload inside the Flashburst development environment.
+## New Or Existing Workload
 
-## Responsibilities
+First inspect project shape: `pyproject.toml`, `requirements.txt`, source
+layout, scripts, CLIs, notebooks/exports, tests, sample inputs, and existing
+manifests. If the repo is only loose Python files plus a uv venv, make it a
+normal uv project unless the user explicitly wants a temporary install. Run
+commands yourself and summarize outcomes; do not give setup commands as the
+main answer.
 
-Workload repo owns business logic, domain dependencies, JSONL manifests, the
-thin `run_job(input_path, output_path, params)` adapter, and optional
-`endpoint.py`.
+```bash
+uv init --bare
+uv add --editable ../flashburst
+```
 
-Flashburst owns binding, DBOS-backed local execution, resume behavior,
-local/cloud placement, R2 staging, Runpod Flash submission, remote output
-download, and `.flashburst/runs/<run-id>/results.jsonl`.
+Use extras only when preparing cloud/hybrid work:
 
-Do not add Flashburst, DBOS, Runpod, boto3, cloud SDKs, or presigned URL logic
-to workload business code.
+```bash
+uv add --editable "../flashburst[runpod,r2]"
+```
 
-## Bootstrap
+Preserve existing CLI behavior. Prefer the least invasive adapter:
 
-- Copy this skill directory into `.agents/skills/flashburst` when repo-local
-  skills are supported.
-- Install Flashburst into the workload repo environment from the local checkout,
-  usually `uv add --editable ../flashburst`.
-- Add Runpod/R2 extras only when preparing or running cloud/hybrid work.
-- Add `AGENTS.md` only when persistent repo-local guidance is useful; keep it
-  short and point back to this skill.
+- If an existing module already has clean callable logic, add `run_job` beside
+  it or bind that callable directly when it already matches the contract.
+- If the workload is a CLI/script, extract reusable core logic and keep the CLI
+  as a wrapper.
+- If extraction is risky, create `flashburst_adapter.py` that imports and calls
+  the existing code.
+- If the project uses `src/`, keep imports package-native and bind with
+  `package.module:run_job`; otherwise `path/to/file.py:run_job` is fine.
 
-## Adapt A Workload
+Editability guardrails:
 
-1. Inspect dependency files, entrypoints, tests, existing manifests, and current
-   `.flashburst` state.
-2. Preserve existing CLI behavior.
-3. Prefer extracting reusable core logic from CLI/notebook-style code before
-   adding Flashburst. Use a smallest wrapper only when extraction is riskier
-   than the requested smoke.
-4. Add a thin adapter:
+- Keep `run_job` as orchestration only: parse the input record, call ordinary
+  workload functions, write output, return metrics.
+- Do not move all logic into `run_job`, `endpoint.py`, generated files, or
+  Flashburst-specific directories.
+- Preserve existing commands and tests. Add focused tests for any extracted core
+  function when the original code had no coverage.
+- Keep sample manifests small, human-readable, and checked in only when they are
+  useful examples. Keep large data, outputs, `.flashburst/`, `.flash/`, and
+  secrets out of git.
+
+Adapter contract:
 
 ```python
 def run_job(input_path: Path, output_path: Path, params: dict) -> dict:
     ...
 ```
 
-5. Keep `endpoint.py` as generated remote glue only; no business logic there.
-6. Create or identify a small JSONL manifest that does real work.
-7. Bind workload, manifest, params, and any local-file stage fields.
-8. Run a local smoke and inspect final status plus outputs.
+The adapter reads one JSON object from `input_path`, writes one result file at
+`output_path` (usually JSONL), and returns `{"status": "succeeded", "metrics": {...}}`
+or `{"status": "failed", "error": "..."}`. Keep all domain dependencies in the
+workload repo's `pyproject.toml`.
+
+Create a tiny real manifest if none exists. Put it somewhere natural for the
+repo, such as `manifests/local-smoke.jsonl`, `examples/manifest.jsonl`, or
+`input.jsonl`:
+
+```jsonl
+{"id":"smoke-1","text":"hello"}
+```
+
+Use local file fields such as `audio_path` only when the file exists relative
+to the workload repo; Flashburst can later stage those same fields through R2.
+
+## Local Workflow
+
+1. Inspect state:
+   `uv run flashburst context --text`.
+2. Diagnose only when needed:
+   `uv run flashburst workload inspect <workload-spec> --json` and
+   `uv run flashburst manifest validate <manifest>`.
+3. Bind workload, manifest, params, and stage fields:
+   `uv run flashburst bind --workload <workload-spec> --manifest <manifest>`.
+   If discovery is unambiguous, `uv run flashburst bind` is acceptable.
+4. Run a bounded local smoke:
+   `uv run flashburst run --run-id local-smoke --local-slots 1`.
+5. Inspect final counts and outputs:
+   `uv run flashburst status --run-id local-smoke --results`.
+
+Generated state lives under `.flashburst/runs/<run-id>/`. Status summaries must
+count only the latest ledger record per job id.
+
+The normal user-facing flow is: user asks for an outcome, agent adapts/binds/runs
+as needed, agent reports changed files plus run ids, counts, and output paths.
+
+## Testing Ladder
+
+- Run the workload repo's normal tests if present, usually `uv run pytest`.
+- Run `uv run flashburst check` for workspace and DBOS readiness.
+- Run one fresh local smoke with a new run id, then inspect `status --results`.
+- For larger local validation, use a bounded real manifest before a full batch.
+- For full local validation, run the bound manifest with an explicit run id and
+  no limit only after the smoke and bounded checks pass.
+- Do not run credentialed R2, deploy, endpoint calls, hybrid runs, paid GPU
+  work, or full batches without explicit approval.
 
 ## Cloud Preparation
 
-- Generate or update `endpoint.py` from the bound workload and compile/import
-  check it.
-- Prefer endpoint dependencies that have prebuilt wheels. Avoid runtime source
-  installs unless that is the smallest reliable compatibility path.
-- Do not package GPU runtime stacks such as CUDA/cuDNN wheels into the Runpod
-  Flash endpoint by default. Use the endpoint's image/CUDA selectors and let
-  the Flash worker image provide the GPU runtime. Local developer machines may
-  need separate local runtime packages; keep that local-only.
-- Ask the user to fill `.env.local` from the Flashburst checkout's
-  `.env.example` when present. Required cloud keys are `R2_BUCKET`,
-  `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and
-  `RUNPOD_API_KEY`.
-- Source `.env.local` without printing secrets. It is okay to report variable
-  names that are present or missing.
-- Configure R2 with non-secret values:
+- Generate remote glue from the bound workload:
+  `uv run flashburst scaffold`.
+- Compile/import check `endpoint.py`; keep it glue-only.
+- Pass non-secret endpoint env as `--env NAME=value`; pass secrets or
+  machine-specific values as `--env-from NAME`. Do not assume `.env.local`
+  values reach deployed workers automatically.
+- Keep resource choices not represented by scaffold flags, such as CUDA
+  selectors, datacenter, image, and network volume details, in workload-owned
+  `endpoint.py`.
+- Prefer endpoint dependencies with wheels. Do not package CUDA/cuDNN runtime
+  stacks by default; use endpoint image/resource settings.
+- For local-file manifests, bind stage fields and configure R2 with non-secret
+  values:
   `uv run flashburst configure r2 --bucket "$R2_BUCKET" --endpoint-url "$R2_ENDPOINT_URL"`.
-  Do not require `R2_ACCOUNT_ID` when `R2_ENDPOINT_URL` is set.
-- Do not ask for `RUNPOD_ENDPOINT_ID` before deployment. `flash deploy`
-  generates it; discover it from deploy output or
-  `uv run flash env get <env> --app <app>`, then save it with
+- Read secrets from environment without printing values. Required cloud env:
+  `R2_BUCKET`, `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`,
+  `R2_SECRET_ACCESS_KEY`, and `RUNPOD_API_KEY`.
+- Do not ask for `RUNPOD_ENDPOINT_ID` before deployment. After approved deploy,
+  discover the id from `flash deploy` or `uv run flash env get <env> --app <app>`
+  and save it with
   `uv run flashburst configure runpod --profile flash-burst --endpoint-id <id>`.
-- Do not ask for `RUNPOD_PROFILE`. It is only Flashburst's local alias; use
-  `flash-burst` unless the user explicitly wants multiple profiles.
-- Stop before uploads, deploys, endpoint calls, or paid GPU work unless the
-  user has approved cloud execution in the conversation.
 
 ## Cloud And Hybrid Runs
 
-- Re-check Flashburst, R2, and Runpod readiness before submission.
-- If the user has expressed intent to perform a cloud test, handle setup with
-  minimal prompting: source `.env.local`, configure R2, generate and verify
-  `endpoint.py`, deploy when needed, discover the endpoint id, and save the
-  `flash-burst` profile.
-- After `flash deploy`, use a deterministic rollout canary. `flash env get`
-  confirms the active build id, and endpoint health shows worker/queue counts,
-  but neither proves a warm queue worker is serving new code. Run a remote-only
-  one-job canary and require its `endpoint_flash_source_fingerprint` to match
-  `.flash/flash_manifest.json` when the endpoint reports that metric. If stale,
-  retry within a bounded rollout window.
-- Run remote-only first with `--local-slots 0 --flash-slots 1`.
-- For true hybrid placement, use at least two manifest records with one local
-  slot and one Flash slot.
-- Bind local-file fields as stage fields so local and cloud runs use the same
-  manifest.
-- Report final status counts, output paths, remote job ids, and any rollout or
-  staging failures.
+- Re-check readiness before submission:
+  `uv run flashburst check --flash --profile flash-burst`.
+- After deploy, run a remote-only canary first:
+  `uv run flashburst run --local-slots 0 --flash-slots 1 --flash-ok --approve-flash`.
+- If the endpoint reports `endpoint_flash_source_fingerprint`, require it to
+  match `.flash/flash_manifest.json`; retry only within a bounded rollout
+  window.
+- For real hybrid placement, use at least two manifest records with one local
+  slot and one Flash slot:
+  `uv run flashburst run --hybrid --approve-flash --run-id hybrid-smoke`.
+- Hybrid should be local-first burst routing: all items enter one DBOS work
+  queue, local slots stay occupied first, and Flash slots handle overflow.
+- For larger hybrid validation, run a bounded real subset first. Run the full
+  bound manifest only after canary and bounded hybrid pass and the user approves
+  the larger paid run.
+- For load tests, start with a small real batch that exercises both local and
+  Flash slots. Record manifest size, slot counts, endpoint `workersMax`, queue
+  observations, final ledger counts, failed records, and output paths.
+- Interpret endpoint concurrency with care: `workersMax=1` validates queueing
+  and handoff, not horizontal scale.
+- For public URL inputs, keep the URL in the manifest and make the workload
+  download it inside the job; do not predownload large files just to stage them.
+- During or after longer runs, inspect DBOS state:
+  `uv run flashburst queue --run-id <run-id> --details`.
 
-## Load Testing
+## Cleanup And Reporting
 
-- Start with a bounded real workload unless the user explicitly asks for a full
-  batch.
-- Use enough records to exercise both local and Flash queues.
-- Note endpoint `workersMax` before interpreting cloud concurrency:
-  `workersMax=1` tests queueing, not horizontal scale.
-- During the run, inspect DBOS queue state from the workload workspace.
-  Prefer `DBOS.list_queued_workflows()` / `DBOS.list_workflows()` when
-  practical; direct SQLite inspection of `.flashburst/dbos.sqlite` can
-  summarize `workflow_status` by `queue_name` and `status`.
-- Endpoint health is separate from DBOS state; it can show Runpod
-  `jobs.inQueue`, `jobs.inProgress`, and worker counts.
-- Report queue observations, final ledger counts, remote job ids, and endpoint
-  health after the run.
-
-## Status And State
-
-- `uv run flashburst context` gives agent-readable binding and next actions.
-- `uv run flashburst status --run-id <id> --results` gives final ledger counts
-  and output paths.
-- Generated run state belongs under `.flashburst/runs/<run-id>/`.
 - Clear only named generated state when explicitly requested. Never delete
-  source manifests, samples, workload code, user outputs, or secrets unless
-  explicitly named.
-- Status summaries should count only the latest ledger record per job id.
-
-## Approval Gates
-
-Ask before modifying core workload logic beyond a thin adapter, deleting user
-data, uploading local files, writing real cloud config, deploying or invoking a
-Runpod endpoint, running paid GPU work, or expanding from a smoke to a full
-batch.
-
-Local smoke testing with local files and no paid cloud resources is allowed.
-
-## Completion Checklist
-
-- Binding/context matches the expected workload.
-- Local smoke succeeded unless the request was inspection-only.
-- Cloud/hybrid runs, when requested and approved, passed a remote-only canary
-  before hybrid or load testing.
-- Outputs and `results.jsonl` exist under `.flashburst/runs/<run-id>/`.
-- Endpoint wrapper is present only when requested and remains glue code.
-- Final response lists changed files, output paths, status counts, remote job
-  ids when relevant, and any paid or credentialed steps intentionally skipped.
+  manifests, samples, workload code, user outputs, or secrets unless named.
+- Report changed files, run id, final counts, output paths, remote job ids when
+  relevant, and any paid or credentialed steps skipped.
