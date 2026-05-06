@@ -1,129 +1,154 @@
 # Flashburst
 
-Flashburst is a lightweight local control plane for **distributing workloads
-across local and cloud GPUs.**
+Flashburst is an agent-native batch runner for Python workloads that need
+durable job state, artifact tracking, resumability, and optional Runpod
+burst capacity.
 
-It runs user-owned Python jobs, defaults to local execution, and can "burst" to
-a Runpod Flash endpoint to get things done faster. It's meant for projects that
-have outgrown a Jupyter notebook and need durable job state, artifact tracking,
-and resumability.
+The user should describe an outcome to an agent, not memorize orchestration
+commands. Flashburst gives the agent a small command surface for inspecting a
+workload repo, binding the right files, running local smoke tests, generating
+Runpod Flash wrappers, and reporting outputs.
 
-My current use case is batch processing podcast transcriptions. I am GPU-poor
+My current use case is batch processing podcast transcriptions. I'm GPU-poor
 with only one 3090, so when there are hundreds of episodes to transcribe, I
-could use a little help. Runpod Flash offers a pretty easy-to-use interface that
-abstracts worker deployment and autoscaling. For transcription I'm using
-`faster-whisper` on an `AMPERE_24` GPU group, with a few cloud workers.
+could use a little help. Runpod Flash abstracts serverless worker deployment
+and autoscaling; for transcription I'm using `faster-whisper` on an
+`AMPERE_24` GPU group.
 
-## Features
+## Agent-Native Flow
 
-Flashburst is simple and local-first:
+In a workload repo, ask an agent for outcomes like:
 
-- We use SQLite as a durable local queue, storing jobs, attempts, leases,
-  artifacts, and results.
-- The local GPU gets first claim. I rescued my poor GPU from a crypto miner's
-  garage and want to put it to good use. Cloud slots only claim `cloud_ok` work
-  when local capacity is already busy.
-- Workloads often involve loading large model weights. Flash workers can keep
-  model state in memory across jobs so we don't have to reload it, as long as
-  the idle timeout has not expired. When the job is done, the workers can scale
-  down to zero.
-- Cloudflare R2 (object storage) serves as the handoff layer between our local
-  controller and cloud workers. We use presigned URLs so cloud workers get only
-  temporary artifact access.
-- Model logic stays in our workload project. Flashburst only owns queueing,
-  placement, artifacts, and state.
+- "Make this repo Flashburst-ready. Preserve the existing CLI."
+- "Bind the obvious workload and manifest, then run a local smoke."
+- "Generate the Runpod Flash endpoint wrapper, but do not deploy it."
+- "After I approve paid cloud work, run one hybrid smoke and report outputs."
+
+The agent uses Flashburst primitives such as `context`, `bind`, `run`,
+`status`, `queue`, and `scaffold`. `context` emits machine-readable project
+state: likely workload functions, JSONL manifests, stageable file fields,
+Runpod profiles, R2 readiness, and the latest result ledger.
+
+## Architecture
 
 ```text
-             .flashburst queue
-                    |
-                    v
-          flashburst run-queue
-                    |
-        +-----------+------------+
-        |                        |
- local slot available?      local slots busy
-        |                        |
-        v                        v
-  run on local GPU       cloud_ok + approved?
-                                 |
-                                 v
-              Cloudflare R2 presigned URL handoff
-                                 |
-                                 v
-                         Runpod Flash worker
+user intent
+   |
+   v
+agent
+   |
+   v
+Flashburst context/bind/run/scaffold
+   |
+   v
+.flashburst/project.json + manifest
+   |
+   v
+prepare inputs under .flashburst/runs/<run-id>/
+   |
+   v
+DBOS work queue
+   |
+   +--> completed job id? skip already-succeeded work
+   |
+   v
+flashburst.routed_job
+   |
+   +--> PRIORITY 1: acquire a local GPU slot
+   |        |
+   |        v
+   |     run_job(input_path, output_path, params)
+   |
+   +--> PRIORITY 2: if flash_ok, cloud is approved,
+   |        and local slots are busy, acquire a Flash slot
+   |        |
+   |        v
+   |     R2 staged files + presigned URLs
+   |        |
+   |        v
+   |     Runpod Flash endpoint
+   |        |
+   |        v
+   |     downloaded output in the same local run tree
+   |
+   v
+append latest record to results.jsonl
 ```
 
-`run-queue` is the foreground controller that imports jobs, leases work to local
-and cloud slots, records attempts, and exits when the selected queue is drained.
-If interrupted, rerun the same command to continue from saved state.
+The workload repo owns business logic:
 
-## Commands
+- `run_job(input_path, output_path, params)`
+- Optional Flash `endpoint.py`
+- JSONL manifests
+- Python dependencies
 
-Flashburst is in alpha; install from a local checkout:
+Flashburst owns orchestration:
 
-```bash
-uv add --editable ../flashburst
-```
+- Agent-readable discovery and binding
+- DBOS queueing and routing across local and Runpod Flash slots
+- R2 staging for cloud inputs and outputs
+- Runpod Flash submission and remote result download
+- `.flashburst/runs/<run-id>/results.jsonl`
 
-Your workload exposes one file-based runner:
+DBOS deduplication ids make reruns resumable: succeeded jobs are skipped. Local
+and cloud records append to one ledger, and successful outputs land under
+`.flashburst/runs/<run-id>/outputs/<job-id>/result.jsonl`.
+
+Cloud work requires explicit user approval. For local-file manifests,
+Flashburst stages inputs in R2, passes presigned input/output URLs to Runpod
+Flash, then downloads remote results into the local run tree. URLs are minted
+inside the DBOS flash step right before submission, so local queue backlog does
+not burn URL lifetime.
+
+## Workload Contract
+
+A Flashburst workload is just a Python callable with a file boundary:
 
 ```python
 from pathlib import Path
 from typing import Any
 
 
-def run_job(input_path: Path, output_path: Path, params: dict[str, Any]) -> dict[str, Any]:
-    # read one input file, write one output file
-    ...
-    return {"status": "succeeded", "metrics": {...}}
+def run_job(
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    record = input_path.read_text(encoding="utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(record, encoding="utf-8")
+    return {"status": "succeeded", "metrics": {}}
 ```
 
-Scaffold the thin Flashburst glue around that runner:
+The workload should not import Flashburst, DBOS, Runpod, or R2 helpers. Keep
+domain code ordinary and editable; let Flashburst handle run state and cloud
+handoff.
 
-```bash
-uv run flashburst workload scaffold \
-  --package my_workload \
-  --capability audio.transcribe.local \
-  --job-type audio.transcribe \
-  --runner-import my_workload.core:run_job
+`podcast-transcriber` is the intended consumer shape: a normal domain repo
+keeps its own CLI and model code, while its README tells an agent to configure
+Flashburst state, run local validation, scaffold or verify `endpoint.py`, and
+only run paid cloud canaries after explicit approval.
+
+## Shared State
+
+Flashburst writes durable local state that both agents and humans can inspect:
+
+```text
+.flashburst/
+  config.json          # non-secret Runpod/R2 settings
+  project.json         # bound workload, manifest, params, stage fields
+  latest-run
+  dbos.sqlite          # default DBOS system database
+  runs/<run-id>/
+    manifest.jsonl
+    inputs/*.json
+    outputs/<job-id>/result.jsonl
+    results.jsonl
 ```
 
-Add `--runpod` if this workload should also be eligible for cloud placement.
+## Docs
 
-Run locally first:
-
-```bash
-uv run flashburst init
-uv run flashburst capability add my_workload.capabilities:capability --project-root .
-uv run python prepare_jobs.py manifest.jsonl
-uv run flashburst run-queue .flashburst/jobs/audio.transcribe.jsonl
-uv run flashburst status --results
-```
-
-## Cloud Burst
-
-Configure a Runpod endpoint and a Cloudflare R2 bucket:
-
-```bash
-uv run flashburst configure r2 \
-  --bucket "$R2_BUCKET" \
-  --endpoint-url "$R2_ENDPOINT_URL"
-
-uv run flashburst configure runpod \
-  --capability audio.transcribe.local \
-  --endpoint-id <runpod-endpoint-id>
-```
-
-Prepare cloud-eligible jobs with your workload script, then allow one local slot
-and one cloud slot:
-
-```bash
-uv run python prepare_jobs.py manifest.jsonl --cloud-ok
-
-uv run flashburst run-queue .flashburst/jobs/audio.transcribe.jsonl \
-  --cloud-slots 1 \
-  --profile runpod-burst \
-  --approve-cloud
-
-uv run flashburst status --pull --results
-```
+For exact command syntax, use [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md).
+For validation paths, use [docs/TESTING.md](docs/TESTING.md). Manual CLI usage
+is supported, but it is backup material; the primary interface is an agent
+carrying the workflow through inspection, execution, validation, and reporting.
