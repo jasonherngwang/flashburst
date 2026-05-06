@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flashburst"
+  short_description: "Adapt and operate Flashburst workloads"
+  default_prompt: "Use $flashburst to adapt this repo to Flashburst, run a local smoke, and stop before paid cloud steps."
