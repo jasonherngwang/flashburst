@@ -137,9 +137,10 @@ def test_stage_field_requires_r2_configuration(tmp_path: Path) -> None:
             "--workspace",
             str(workspace),
         ],
+        env={"CI": "true", "GITHUB_ACTIONS": "true"},
     )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 1
     assert "--stage-field requires R2 configuration" in result.output
 
 
